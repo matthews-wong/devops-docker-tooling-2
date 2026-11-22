@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+
+# ---- builder: render the landing page with build metadata ----
+# nginx:alpine ships envsubst (used by its /etc/nginx/templates feature),
+# so no extra packages are needed to template content at build time.
+# Digest-pinned: reproducible builds even if the tag moves. Bump with
+# `docker buildx imagetools inspect nginx:1.31-alpine` and update both stages.
+FROM nginx:1.31-alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2 AS build
+
+ARG BUILD_VERSION=dev
+ARG BUILD_DATE=unknown
+
+COPY scripts/render.sh /tmp/render.sh
+COPY content/ /src/
+RUN /tmp/render.sh /src/index.html > /src/index.html.rendered \
+    && mv /src/index.html.rendered /src/index.html
+
+# ---- runtime: minimal static server ----
+FROM nginx:1.31-alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2
+
+# Redeclare build args in this stage (ARG scope is per-stage) so the
+# provenance labels below can record what the image was stamped with.
+ARG BUILD_VERSION=dev
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="docker-tooling static site" \
+      org.opencontainers.image.description="Reference nginx static-site image: digest-pinned, non-root, healthchecked" \
+      org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="https://github.com/matthews-wong/devops-docker-tooling" \
+      org.opencontainers.image.licenses="MIT"
+
+# nginx needs writable cache/pid dirs; runtime user comes from the base image.
+# Remove the default config so the port + server block below are the only one.
+# nginx.conf sets `pid /run/nginx.pid;` - list both /var/run and /run
+# explicitly (rather than relying on one being a symlink to the other) since
+# BusyBox chown's recursive symlink handling isn't guaranteed to dereference.
+RUN rm -f /etc/nginx/conf.d/default.conf && \
+    chown -R nginx:nginx /var/cache/nginx /var/run /run
+
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /src/ /usr/share/nginx/html/
+
+# Service runs as nginx, not root.
+USER nginx
+
+EXPOSE 8080
+
+# nginx drains connections on SIGQUIT; the default SIGTERM cuts them off.
+STOPSIGNAL SIGQUIT
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1

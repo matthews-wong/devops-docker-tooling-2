@@ -1,0 +1,79 @@
+SHELL := /bin/sh
+
+# Override on a podman-only box: make build DOCKER=podman
+DOCKER ?= docker
+BUILD_VERSION ?= dev
+BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
+
+.DEFAULT_GOAL := help
+
+.PHONY: help build build-release up down logs lint check-pins check-render check-version-drift test scan validate render syntax smoke-test clean
+
+# List targets that carry a leading '## ' comment
+help:
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/^([a-z-]+):.*## /\1\t/' | column -t -s "$$(printf '\t')"
+
+build: ## Build the image
+	$(DOCKER) build -t docker-tooling-site .
+
+build-release:
+	$(DOCKER) build --build-arg BUILD_VERSION=$(BUILD_VERSION) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) \
+		-t docker-tooling-site:$(BUILD_VERSION) .
+
+up: ## Start the compose stack
+	$(DOCKER) compose up -d --build
+
+down: ## Stop the compose stack
+	$(DOCKER) compose down
+
+logs:
+	$(DOCKER) compose logs -f
+
+# Render the landing page template without a Docker daemon (see scripts/render.sh)
+render:
+	BUILD_VERSION=$(BUILD_VERSION) BUILD_DATE=$(BUILD_DATE) scripts/render.sh
+
+# Local validation without a running daemon
+lint:
+	hadolint Dockerfile
+
+# Parse-check every shell script; shellcheck runs too when installed
+syntax:
+	@set -e; for f in scripts/*.sh; do sh -n "$$f"; done; \
+	if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/*.sh; fi; \
+	echo "syntax: all scripts parse cleanly"
+
+check-pins:
+	scripts/check-pins.sh
+
+# Render the template and fail on any leftover ${...} placeholder
+check-render:
+	scripts/check-render.sh
+
+# Fail if README/docs/landing-page prose still names the old base tag
+check-version-drift:
+	scripts/check-version-drift.sh
+
+test:
+	scripts/test-check-pins.sh
+	scripts/test-check-version-drift.sh
+	scripts/test-nginx-conf.sh
+	sh scripts/neg-check-render.sh
+
+# Optional: trivy misconfig/CVE/SBOM scan (skips gracefully if trivy is absent)
+scan:
+	scripts/scan.sh
+
+# Build the image and exercise it end to end (needs a Docker daemon)
+smoke-test: build ## Build and exercise the image (needs Docker)
+	$(DOCKER) tag docker-tooling-site docker-tooling-site:ci
+	scripts/smoke-test.sh docker-tooling-site:ci
+
+validate: lint syntax check-pins check-render check-version-drift test render ## Run every local check
+	$(DOCKER) compose config --quiet
+
+# Remove images left behind by build/smoke-test and any local scan output
+clean: ## Remove local images and scan output
+	-$(DOCKER) rmi docker-tooling-site:ci docker-tooling-site 2>/dev/null
+	rm -f sbom.cdx.json
